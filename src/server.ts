@@ -5,6 +5,10 @@ import Database from "better-sqlite3";
 import fs from "node:fs";
 import path from "node:path";
 
+// IMPORTANT (ESM): include the .js extension so Node can resolve compiled output in dist/
+import { loadEmailConfig, sendEmail } from "./email/provider.js";
+import { buildWelcomeEmail } from "./email/welcome.js";
+
 type SignupBody = {
   email: string;
   name?: string;
@@ -39,50 +43,82 @@ await app.register(rateLimit, { global: true, max: 30, timeWindow: "1 minute" })
 
 app.get("/healthz", async () => ({ ok: true }));
 
-app.post<{ Body: SignupBody }>("/v1/signup", {
-  schema: {
-    body: {
-      type: "object",
-      additionalProperties: false,
-      required: ["email"],
-      properties: {
-        email: { type: "string", minLength: 3, maxLength: 320 },
-        name: { type: "string", minLength: 1, maxLength: 80 },
-        source: { type: "string", minLength: 1, maxLength: 80 },
-        hp: { type: "string", maxLength: 200 }
+app.post<{ Body: SignupBody }>(
+  "/v1/signup",
+  {
+    schema: {
+      body: {
+        type: "object",
+        additionalProperties: false,
+        required: ["email"],
+        properties: {
+          email: { type: "string", minLength: 3, maxLength: 320 },
+          name: { type: "string", minLength: 1, maxLength: 80 },
+          source: { type: "string", minLength: 1, maxLength: 80 },
+          hp: { type: "string", maxLength: 200 }
+        }
       }
     }
-  }
-}, async (req, reply) => {
-  const { email, name, source, hp } = req.body;
+  },
+  async (req, reply) => {
+    const { email, name, source, hp } = req.body;
 
-  if (hp && hp.trim().length > 0) return reply.code(204).send();
+    // Honeypot: silently accept but do nothing
+    if (hp && hp.trim().length > 0) return reply.code(204).send();
 
-  const normalizedEmail = String(email).trim().toLowerCase();
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {
-    return reply.code(400).send({ error: "invalid_email" });
-  }
-
-  const ip = req.ip;
-  const userAgent = req.headers["user-agent"] ?? null;
-
-  try {
-    insertStmt.run({
-      email: normalizedEmail,
-      name: name?.trim() || null,
-      source: source?.trim() || null,
-      ip,
-      user_agent: userAgent
-    });
-    return reply.code(201).send({ ok: true });
-  } catch (err: any) {
-    if (String(err?.message || "").includes("UNIQUE")) {
-      return reply.code(200).send({ ok: true, already: true });
+    const normalizedEmail = String(email).trim().toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {
+      return reply.code(400).send({ error: "invalid_email" });
     }
-    req.log.error({ err }, "signup_insert_failed");
-    return reply.code(500).send({ error: "server_error" });
+
+    const ip = req.ip;
+    const userAgent = req.headers["user-agent"] ?? null;
+
+    try {
+      // ---- DB INSERT (authoritative success gate) ----
+      insertStmt.run({
+        email: normalizedEmail,
+        name: name?.trim() || null,
+        source: source?.trim() || null,
+        ip,
+        user_agent: userAgent
+      });
+
+      // ---- BEST-EFFORT WELCOME EMAIL ----
+      try {
+        const emailCfg = loadEmailConfig(process.env);
+
+        // If provider not configured, do nothing.
+        if (emailCfg.provider !== "none") {
+          const msg = buildWelcomeEmail({
+            productName: "ThesisWeb",
+            supportUrl: "https://thesisweb.com/#support"
+          });
+
+          await sendEmail(emailCfg, {
+            to: normalizedEmail,
+            subject: msg.subject,
+            text: msg.text,
+            html: msg.html
+          });
+        }
+      } catch (err) {
+        // Email must NEVER affect signup success
+        req.log.warn({ err }, "welcome_email_failed");
+      }
+
+      return reply.code(201).send({ ok: true });
+    } catch (err: any) {
+      // Duplicate email → idempotent success
+      if (String(err?.message || "").includes("UNIQUE")) {
+        return reply.code(200).send({ ok: true, already: true });
+      }
+
+      req.log.error({ err }, "signup_insert_failed");
+      return reply.code(500).send({ error: "server_error" });
+    }
   }
-});
+);
 
 await app.listen({ host: HOST, port: PORT });
 app.log.info({ host: HOST, port: PORT, db: DB_PATH }, "server_listening");
